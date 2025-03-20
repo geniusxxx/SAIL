@@ -5,12 +5,12 @@ img2dataset --url_list yfcc15m_3long_3short_1raw_captions_url.parquet \
             --input_format "parquet" \
             --url_col "Image Path" \
             --output_format webdataset \
-            --output_folder /data/xuboyu/dataSet/DreamLIP23M/yfcc15m_recap_wds/train \
+            --output_folder /mnt/shared_8/dataSet/DreamLIP23M/yfcc15m_recap_wds/train \
             --processes_count 16 \
             --thread_count 128 \
             --resize_mode no \
             --enable_wandb True \
-            --tmp_dir /data/xuboyu/dataSet/DreamLIP23M/yfcc15m_recap_wds/train \
+            --tmp_dir /mnt/shared_8/dataSet/DreamLIP23M/yfcc15m_recap_wds/train/tmp \
             --save_additional_columns "[raw_caption,shortIB_captions,longIB_captions,shortSV_captions,longSV_captions,shortLLA_captions,longLLA_captions]"
 
 # img2dataset --url_list cc12m_3long_3short_1raw_captions_url.csv \

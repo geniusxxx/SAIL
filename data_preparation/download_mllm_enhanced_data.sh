@@ -36,9 +36,9 @@
 #!/bin/bash
 
 # CC3M数据集目录设置
-SAVE_DIR="/data/xuboyu/dataSet/DreamLIP23M/yfcc15m_recap"
+SAVE_DIR="/mnt/shared_8/dataSet/DreamLIP23M/yfcc15m_recap"
 TMP_DIR="tmp"
-WDS_DIR="/data/xuboyu/dataSet/DreamLIP23M/yfcc15m_recap_wds"
+WDS_DIR="/mnt/shared_8/dataSet/DreamLIP23M/yfcc15m_recap_wds"
 
 # 创建所需目录
 mkdir -p ${SAVE_DIR}
@@ -55,5 +55,5 @@ python download_images.py \
   --save_dir ${SAVE_DIR} \
   --tmp_dir ${TMP_DIR} \
   --wds_dir ${WDS_DIR} \
-  --convert_to_wds \
-  --shard_size 10000
+  # --convert_to_wds \
+  # --shard_size 10000
