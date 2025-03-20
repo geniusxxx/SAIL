@@ -1,0 +1,7 @@
+tmp/
+
+cc3m_3long_3short_1raw_captions_url.csv
+cc12m_3long_3short_1raw_captions_url.csv
+yfcc15m_3long_3short_1raw_captions_url.csv
+cc3m_3long_3short_1raw_captions_url.parquet
+cc3m_3long_3short_1raw_captions_url_ori.csv

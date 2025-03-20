@@ -1,6 +1,7 @@
 import csv
 import os
 from tqdm import tqdm
+import argparse
 from PIL import ImageFile, UnidentifiedImageError, Image  # Import UnidentifiedImageError
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, message="Corrupt EXIF data")
