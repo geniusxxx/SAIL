@@ -6,18 +6,99 @@ import zlib
 import os
 import shelve
 import magic
-import time  # 添加time模块
+import time
 from multiprocessing import Pool
 from tqdm import tqdm
 from PIL import Image
 import io
 import json
-import tarfile
+import hashlib
 
-# Parse command line arguments
+# 导入WebDataset转换器
+# 如果需要WebDataset转换功能，使用以下导入
+# from webdataset_converter import convert_to_webdataset
+
+class DownloadStats:
+    """下载统计类"""
+    def __init__(self, save_dir):
+        self.failed_count = 0
+        self.success_count = 0
+        self.failed_urls = []
+        self.total_bytes = 0
+        self.start_time = time.time()
+        self.save_dir = save_dir
+        self.failed_log_path = os.path.join(save_dir, 'failed_downloads.csv')
+        self.detailed_log_path = os.path.join(save_dir, 'download_details.csv')
+        
+        # 创建或清空失败日志文件
+        with open(self.failed_log_path, 'w', encoding='utf-8') as f:
+            f.write("Time,URL,Status,Error\n")
+            
+        # 创建详细日志文件
+        with open(self.detailed_log_path, 'w', encoding='utf-8') as f:
+            f.write("Time,URL,Status,Path,Size,MimeType\n")
+            
+    def update(self, row):
+        """更新统计信息"""
+        current_time = time.strftime('%Y-%m-%d %H:%M:%S')
+        
+        if row['status'] != 200:
+            self.failed_count += 1
+            error_msg = row.get('error_message', '')
+            
+            # 添加到内存中的失败列表
+            self.failed_urls.append({
+                'url': row['url'],
+                'status': row['status'],
+                'time': current_time,
+                'error': error_msg
+            })
+            
+            # 实时写入失败记录到文件
+            with open(self.failed_log_path, 'a', encoding='utf-8') as f:
+                f.write(f"{current_time},{row['url']},{row['status']},{error_msg}\n")
+        else:
+            self.success_count += 1
+            # 累计下载字节数（如果有）
+            if 'size' in row:
+                self.total_bytes += row['size']
+            
+        # 记录所有下载详情（无论成功或失败）
+        with open(self.detailed_log_path, 'a', encoding='utf-8') as f:
+            path = row.get('file', '')
+            size = row.get('size', 0)
+            mime = row.get('mimetype', '')
+            f.write(f"{current_time},{row['url']},{row['status']},{path},{size},{mime}\n")
+            
+    def print_stats(self):
+        """打印当前统计信息"""
+        total = self.success_count + self.failed_count
+        elapsed_time = time.time() - self.start_time
+        
+        if total > 0:
+            success_rate = (self.success_count / total) * 100
+            avg_speed = self.total_bytes / (elapsed_time + 0.001) / 1024 / 1024  # MB/s
+            
+            print(f"\n当前下载统计:")
+            print(f"总数: {total}")
+            print(f"成功: {self.success_count} ({success_rate:.2f}%)")
+            print(f"失败: {self.failed_count} ({100-success_rate:.2f}%)")
+            print(f"平均速度: {avg_speed:.2f} MB/s")
+            print(f"已用时间: {elapsed_time:.1f}秒")
+            print(f"失败记录保存在: {self.failed_log_path}")
+            print(f"详细记录保存在: {self.detailed_log_path}")
+
+# # Parse command line arguments
+# headers = {
+#     'User-Agent':'Googlebot-Image/1.0', # Pretend to be googlebot
+#     'X-Forwarded-For': '64.18.15.200'
+# }
 headers = {
-    'User-Agent':'Googlebot-Image/1.0', # Pretend to be googlebot
-    'X-Forwarded-For': '64.18.15.200'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Referer': 'https://www.google.com/',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Connection': 'keep-alive',
 }
 
 def _df_split_apply(tup_arg):
@@ -27,15 +108,7 @@ def _df_split_apply(tup_arg):
 
 def df_multiprocess(df, processes, chunk_size, func, dataset_name, save_dir='.'):
     """
-    多进程处理DataFrame
-    
-    参数:
-    df - 数据框
-    processes - 进程数
-    chunk_size - 每块处理的记录数
-    func - 处理函数
-    dataset_name - 数据集名称
-    save_dir - 保存临时文件的目录，默认为当前目录
+    多进程处理DataFrame并确保数据正确写入
     """
     # 确保保存目录存在
     os.makedirs(save_dir, exist_ok=True)
@@ -45,27 +118,95 @@ def df_multiprocess(df, processes, chunk_size, func, dataset_name, save_dir='.')
     print(f"临时文件将保存到: {tmp_file_path}")
     
     print("生成数据分片...")
-    with shelve.open(tmp_file_path) as results:
-        pbar = tqdm(total=len(df), position=0)
-        # 断点续传:
+    
+    # 初始化统计对象
+    stats = DownloadStats(save_dir)
+    
+    with shelve.open(tmp_file_path, writeback=True) as results:
+        # 创建更丰富的进度条
+        pbar = tqdm(
+            total=len(df), 
+            position=0,
+            desc="准备中",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+            postfix={"成功": 0, "失败": 0, "成功率": "0%"}
+        )
+        
+        # 断点续传
         finished_chunks = set([int(k) for k in results.keys()])
         pbar.desc = "继续下载"
         for k in results.keys():
-            pbar.update(len(results[str(k)][1]))
+            chunk_data = results[str(k)][1]
+            pbar.update(len(chunk_data))
+            
+            # 更新统计信息
+            for _, row in chunk_data.iterrows():
+                stats.update(row)
+                
+            print(f"已加载已完成的chunk {k}, 包含 {len(chunk_data)} 条记录")
 
-        pool_data = ((index, df[i:i + chunk_size], func) for index, i in enumerate(range(0, len(df), chunk_size)) if index not in finished_chunks)
-        print(int(len(df) / chunk_size), "个分片。", "每个分片", chunk_size, "条记录。", "使用", processes, "个进程")
+        # 生成待处理的数据分片
+        pool_data = [(index, df[i:i + chunk_size], func) 
+                    for index, i in enumerate(range(0, len(df), chunk_size)) 
+                    if index not in finished_chunks]
+        
+        print(f"待处理分片数: {len(pool_data)}, 每个分片大小: {chunk_size}")
 
         pbar.desc = "下载中"
         with Pool(processes) as pool:
             for i, result in enumerate(pool.imap_unordered(_df_split_apply, pool_data, 2)):
-                results[str(result[0])] = result
-                pbar.update(len(result[1]))
+                try:
+                    chunk_index = str(result[0])
+                    chunk_data = result[1]
+                    
+                    # 更新统计信息
+                    success_in_chunk = 0
+                    failure_in_chunk = 0
+                    
+                    for _, row in chunk_data.iterrows():
+                        stats.update(row)
+                        if row['status'] == 200:
+                            success_in_chunk += 1
+                        else:
+                            failure_in_chunk += 1
+                    
+                    # 更新进度条显示
+                    success_count = stats.success_count
+                    failed_count = stats.failed_count
+                    total_count = success_count + failed_count
+                    success_rate = success_count / (total_count or 1) * 100
+                    
+                    pbar.set_postfix(
+                        成功=success_count, 
+                        失败=failed_count, 
+                        成功率=f"{success_rate:.1f}%"
+                    )
+                    
+                    # 每处理100张图片打印一次统计
+                    if total_count % 100 == 0:
+                        stats.print_stats()
+                    
+                    # 写入数据并立即同步
+                    results[chunk_index] = result
+                    results.sync()
+                    
+                    print(f"成功写入chunk {chunk_index}, "
+                          f"包含 {len(chunk_data)} 条记录 "
+                          f"(成功: {success_in_chunk}, "
+                          f"失败: {failure_in_chunk})")
+                    
+                    pbar.update(len(chunk_data))
+                except Exception as e:
+                    print(f"写入chunk {result[0]} 失败: {str(e)}")
+                    continue
+        
         pbar.close()
+        
+        # 打印最终统计信息
+        print("\n下载完成，最终统计:")
+        stats.print_stats()
 
-    print("下载完成.")
-    return
-
+    return df_from_shelve(chunk_size, func, dataset_name, save_dir)
 
 # For checking mimetypes separately without download
 def check_mimetype(row):
@@ -77,18 +218,15 @@ def check_mimetype(row):
 # Don't download image, just check with a HEAD request, can't resume.
 # Can use this instead of download_image to get HTTP status codes.
 def check_download(row):
-    fname = _file_name(row)
     try:
         # not all sites will support HEAD
         response = requests.head(row['url'], stream=False, timeout=5, allow_redirects=True, headers=headers)
         row['status'] = response.status_code
         row['headers'] = dict(response.headers)
-    except:
-        # log errors later, set error as 408 timeout
-        row['status'] = 408
-        return row
-    if response.ok:
-        row['file'] = fname
+    except Exception as e:
+        # 记录具体错误信息
+        row['status'] = 408  # 超时错误
+        row['error_message'] = str(e)
     return row
 
 def download_image(row):
@@ -101,8 +239,9 @@ def download_image(row):
         try:
             row['mimetype'] = magic.from_file(fname, mime=True)
             row['size'] = os.stat(fname).st_size
-        except:
+        except Exception as e:
             row['status'] = 500  # 文件可能损坏
+            row['error_message'] = f"文件已存在但损坏: {str(e)}"
         return row
 
     # 添加重试机制
@@ -124,141 +263,58 @@ def download_image(row):
                 try:
                     start_time = time.time()
                     max_download_time = 30  # 最大下载时间30秒
+                    total_size = 0
                     
                     with open(fname, 'wb') as out_file:
                         for chunk in response.iter_content(chunk_size=8192):
                             if time.time() - start_time > max_download_time:
                                 raise TimeoutError("Download took too long")
                             if chunk:
+                                total_size += len(chunk)
                                 out_file.write(chunk)
                     
                     row['mimetype'] = magic.from_file(fname, mime=True)
                     row['size'] = os.stat(fname).st_size
                     row['file'] = fname
+                    row['downloaded_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
                     return row
                 except Exception as e:
                     if retry < max_retries - 1:
                         time.sleep(retry_delay * (retry + 1))  # 指数退避
                         continue
                     row['status'] = 408
+                    row['error_message'] = f"下载中断: {str(e)}"
                     return row
+            else:
+                row['error_message'] = f"HTTP错误: {response.status_code}"
         except Exception as e:
             if retry < max_retries - 1:
                 time.sleep(retry_delay * (retry + 1))
                 continue
             row['status'] = 408
+            row['error_message'] = f"请求异常: {str(e)}"
             return row
     
     return row
-
-def create_sample_for_webdataset(row):
-    """为每个图像创建一个WebDataset样本，保留所有文本描述"""
-    try:
-        image_path = row['file']
-        
-        # 读取图像
-        img = Image.open(image_path)
-        img_bytes = io.BytesIO()
-        img.save(img_bytes, format=img.format or 'JPEG')
-        img_bytes = img_bytes.getvalue()
-        
-        # 创建包含所有可能文本描述的元数据
-        metadata = {
-            'url': row['url']
-        }
-        
-        # 添加所有标准文本字段，如果存在的话
-        text_fields = [
-            'raw_caption',
-            'shortIB_captions', 'longIB_captions',
-            'shortSV_captions', 'longSV_captions',
-            'shortLLA_captions', 'longLLA_captions'
-        ]
-        
-        for field in text_fields:
-            if field in row:
-                metadata[field] = row[field]
-        
-        # 兼容处理其他可能的字段命名
-        alt_fields = {
-            'caption': 'raw_caption',
-            'long_caption_0': 'longIB_captions',
-            'long_caption_1': 'longSV_captions',
-            'long_caption_2': 'longLLA_captions',
-            'short_caption_0': 'shortIB_captions',
-            'short_caption_1': 'shortSV_captions',
-            'short_caption_2': 'shortLLA_captions'
-        }
-        
-        for alt_field, std_field in alt_fields.items():
-            if alt_field in row and std_field not in metadata:
-                metadata[std_field] = row[alt_field]
-        
-        # 添加其他有用的元数据，如图像尺寸、状态等
-        additional_fields = [
-            'key', 'status', 'error_message', 
-            'width', 'height', 'original_width', 'original_height',
-            'sha256', 'exif'
-        ]
-        
-        for field in additional_fields:
-            if field in row:
-                metadata[field] = row[field]
-        
-        # 如果没有key字段，使用文件名作为键
-        if 'key' not in metadata:
-            metadata['key'] = os.path.basename(image_path).split('.')[0]
-        
-        # 创建JSON
-        json_data = json.dumps(metadata, ensure_ascii=False).encode('utf-8')
-        
-        # 创建样本ID（优先使用key字段，其次使用图像名的哈希值）
-        sample_id = metadata.get('key', os.path.basename(image_path).split('.')[0])
-        
-        return {
-            'success': True,
-            'id': sample_id,
-            'img': img_bytes,
-            'json': json_data
-        }
-    except Exception as e:
-        # 出错时返回错误信息
-        error_id = 'unknown'
-        if 'image_path' in locals():
-            error_id = os.path.basename(image_path).split('.')[0]
-        elif 'row' in locals() and 'key' in row:
-            error_id = row['key']
-            
-        return {
-            'success': False,
-            'id': error_id,
-            'error': str(e)
-        }
 
 def open_csv(fname, folder, save_dir, start_index=None, end_index=None):
     print("打开数据文件 %s..." % fname)
     df = pd.read_csv(fname)
     
     # 确保包含必要列
-    if 'Image Url' in df.columns:
-        df = df.rename(columns={'Image Url': 'url'})
-    elif 'url' not in df.columns:
-        # 尝试其他可能的列名
-        for col in df.columns:
-            if 'url' in col.lower():
-                df = df.rename(columns={col: 'url'})
-                break
+    if 'url' not in df.columns:
+        df['url'] = df['Image Path']
     
-    # 图像路径相对于save_dir，而不是绝对路径
-    if 'Image Path' not in df.columns:
-        if 'key' in df.columns:
-            # 使用key作为文件名但不包含save_dir前缀
-            df['Image Path'] = df.apply(lambda row: os.path.join(folder, f"{row['key']}.jpg"), axis=1)
-        else:
-            # 使用URL哈希作为文件名
-            df['Image Path'] = df.apply(lambda row: os.path.join(folder, f"{hash(row['url'])}.jpg"), axis=1)
+    # 使用MD5哈希替代Python的hash函数
+    def get_md5_filename(url):
+        # 使用MD5算法对URL进行哈希
+        md5_hash = hashlib.md5(url.encode()).hexdigest()
+        return f"{md5_hash}.jpg"
     
-    # 添加save_dir列，供download_image使用
+    # 应用新的哈希命名方式
+    df['Image Path'] = df['url'].apply(get_md5_filename)
+    
+    # 添加save_dir列
     df['save_dir'] = save_dir
     
     if start_index is not None and end_index is not None:
@@ -277,121 +333,6 @@ def df_from_shelve(chunk_size, func, dataset_name, save_dir='.'):
         keylist = sorted([int(k) for k in results.keys()])
         df = pd.concat([results[str(k)][1] for k in keylist], sort=True)
     return df
-
-def convert_to_webdataset(df, output_path, dataset_name, num_processes=8, shard_size=1000):
-    """将下载的图像转换为WebDataset格式
-    
-    参数:
-    df - 包含图像信息的DataFrame (必须包含'file'列和图像路径)
-    output_path - WebDataset输出目录
-    dataset_name - 数据集名称，用于创建分片文件名
-    num_processes - 用于转换的进程数
-    shard_size - 每个WebDataset分片中的样本数量
-    """
-    print(f"转换为WebDataset格式，输出到 {output_path}")
-    
-    # 筛选有效图像
-    valid_df = filter_valid_images(df)
-    
-    # 创建输出目录
-    os.makedirs(output_path, exist_ok=True)
-    
-    # 准备多进程转换
-    batch_size = shard_size * 10  # 每个进程处理10个分片
-    batches = []
-    for i in range(0, len(valid_df), batch_size):
-        batches.append(valid_df.iloc[i:i+batch_size])
-    
-    print(f"将数据分成 {len(batches)} 个批次进行处理")
-    
-    all_shards = []
-    with Pool(num_processes) as pool:
-        batch_args = [(batch, output_path, f"{dataset_name}", shard_size) for batch in batches]
-        for i, result in enumerate(tqdm(pool.starmap(process_batch_to_webdataset, batch_args), total=len(batches), desc="转换为WebDataset")):
-            all_shards.extend(result)
-    
-    # 创建索引文件
-    with open(os.path.join(output_path, f"{dataset_name}_shards.txt"), "w") as f:
-        for shard in all_shards:
-            f.write(f"{os.path.basename(shard)}\n")
-    
-    print(f"转换完成，共创建 {len(all_shards)} 个WebDataset分片")
-    return all_shards
-
-def filter_valid_images(df):
-    """筛选有效的图像（成功下载且是图像类型）"""
-    print(f"开始筛选有效图像，初始数量: {len(df)}")
-    
-    # 只保留状态为200的行
-    filtered_df = df[df['status'] == 200].copy()
-    print(f"HTTP状态码为200的图像: {len(filtered_df)}")
-    
-    # 确保file列存在
-    if 'file' not in filtered_df.columns:
-        # 如果没有file列但有Image Path列，使用它
-        if 'Image Path' in filtered_df.columns:
-            if 'save_dir' in filtered_df.columns:
-                # 如果有save_dir列，构建完整路径
-                filtered_df['file'] = filtered_df.apply(
-                    lambda row: os.path.join(row['save_dir'], row['Image Path']), axis=1
-                )
-            else:
-                # 否则直接使用Image Path
-                filtered_df['file'] = filtered_df['Image Path']
-    
-    # 检查文件是否存在
-    filtered_df = filtered_df[filtered_df['file'].apply(lambda x: os.path.isfile(x))]
-    print(f"文件存在的图像: {len(filtered_df)}")
-    
-    # 检查mimetype以确保是图像（如果mimetype列存在）
-    if 'mimetype' in filtered_df.columns:
-        filtered_df = filtered_df[filtered_df['mimetype'].str.startswith('image/')]
-        print(f"MIME类型为图像的文件: {len(filtered_df)}")
-    
-    # 检查文件大小（如果size列存在）
-    if 'size' in filtered_df.columns:
-        filtered_df = filtered_df[filtered_df['size'] > 1024]  # 大于1KB
-        print(f"大小合适的图像: {len(filtered_df)}")
-    
-    print(f"筛选后剩余 {len(filtered_df)} 张有效图像，占原始数据的 {len(filtered_df)/len(df)*100:.2f}%")
-    return filtered_df
-
-def process_batch_to_webdataset(batch_df, output_path, shard_prefix, shard_size=1000):
-    """将一批数据处理成WebDataset分片"""
-    os.makedirs(output_path, exist_ok=True)
-    
-    # 将数据分成更小的分片
-    shards = []
-    for i in range(0, len(batch_df), shard_size):
-        shard_df = batch_df.iloc[i:i+shard_size]
-        shards.append(shard_df)
-    
-    results = []
-    for shard_idx, shard_df in enumerate(shards):
-        shard_path = os.path.join(output_path, f"{shard_prefix}_{shard_idx:06d}.tar")
-        
-        # 创建tar文件
-        with tarfile.open(shard_path, "w") as tar:
-            for _, row in shard_df.iterrows():
-                sample = create_sample_for_webdataset(row)
-                if not sample['success']:
-                    continue
-                
-                sample_id = sample['id']
-                
-                # 添加图像到tar
-                img_info = tarfile.TarInfo(f"{sample_id}.jpg")
-                img_info.size = len(sample['img'])
-                tar.addfile(img_info, io.BytesIO(sample['img']))
-                
-                # 添加JSON到tar
-                json_info = tarfile.TarInfo(f"{sample_id}.json")
-                json_info.size = len(sample['json'])
-                tar.addfile(json_info, io.BytesIO(sample['json']))
-        
-        results.append(shard_path)
-    
-    return results
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='下载图像并转换为WebDataset格式')
@@ -455,10 +396,14 @@ if __name__ == '__main__':
 
     # 第二步：如果需要，转换为WebDataset格式
     if args.convert_to_wds:
-        convert_to_webdataset(
-            df=df, 
-            output_path=os.path.join(args.wds_dir, args.data_name),
-            dataset_name=args.data_name,
-            num_processes=args.wds_processes,
-            shard_size=args.shard_size
-        )
+        try:
+            from webdataset_converter import convert_to_webdataset
+            convert_to_webdataset(
+                df=df, 
+                output_path=os.path.join(args.wds_dir, args.data_name),
+                dataset_name=args.data_name,
+                num_processes=args.wds_processes,
+                shard_size=args.shard_size
+            )
+        except ImportError:
+            print("错误: 未能导入webdataset_converter模块，请确保webdataset_converter.py文件在同一目录中")

@@ -55,7 +55,7 @@ def convert_to_parquet(csv_path, output_path=None):
 
 if __name__ == '__main__':
 
-    csv_path = 'cc3m_3long_3short_1raw_captions_url.csv'
-    output_path = 'cc3m_3long_3short_1raw_captions_url.parquet'
+    csv_path = 'yfcc15m_3long_3short_1raw_captions_url.csv'
+    output_path = 'yfcc15m_3long_3short_1raw_captions_url.parquet'
     convert_to_parquet(csv_path, output_path)
 

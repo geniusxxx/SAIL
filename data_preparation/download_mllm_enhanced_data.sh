@@ -36,9 +36,9 @@
 #!/bin/bash
 
 # CC3M数据集目录设置
-SAVE_DIR="/mnt/shared_8/dataSet/DreamLIP23M/cc3m_recap"
+SAVE_DIR="/data/xuboyu/dataSet/DreamLIP23M/yfcc15m_recap"
 TMP_DIR="tmp"
-WDS_DIR="/mnt/shared_8/dataSet/DreamLIP23M/cc3m_recap_wds"
+WDS_DIR="/data/xuboyu/dataSet/DreamLIP23M/yfcc15m_recap_wds"
 
 # 创建所需目录
 mkdir -p ${SAVE_DIR}
@@ -48,10 +48,10 @@ mkdir -p ${WDS_DIR}
 # 下载CC3M图像并转换为WebDataset格式
 echo "下载CC3M数据集并转换为WebDataset格式"
 python download_images.py \
-  --csv_path cc3m_3long_3short_1raw_captions_url.csv \
-  --data_name cc3m \
-  --num_processes 64 \
-  --chunk_size 500 \
+  --csv_path test.csv \
+  --data_name yfcc15m \
+  --num_processes 32 \
+  --chunk_size 10 \
   --save_dir ${SAVE_DIR} \
   --tmp_dir ${TMP_DIR} \
   --wds_dir ${WDS_DIR} \
