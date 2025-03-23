@@ -10,6 +10,8 @@ import hashlib
 import argparse
 from pathlib import Path
 import tempfile
+import stat
+import subprocess
 
 def verify_paths_safety(input_dir, output_dir):
     """验证输入输出路径安全性"""
@@ -80,18 +82,32 @@ def create_url_to_captions_map(parquet_path):
     print(f"URL映射创建完成，共 {len(url_to_captions)} 个有效URL")
     return url_to_captions
 
-def process_single_tar(original_tar_path, new_tar_path, url_to_captions_map, stats):
+def process_single_tar(original_tar_path, new_tar_path, url_to_captions_map, stats, unmatched_urls=None):
     """处理单个tar文件，创建新的tar文件"""
     # 创建唯一的临时目录名称 - 使用系统临时目录
     tar_basename = os.path.basename(original_tar_path)
     temp_dir = tempfile.mkdtemp(prefix=f"recap_wds_{get_file_hash(original_tar_path)}_", dir="/tmp")
     print(f"创建临时目录: {temp_dir}")
     
+    # 如果提供了unmatched_urls，则收集未匹配的URL
+    local_unmatched_urls = []
+    
     try:
         # 1. 提取原tar文件
         print(f"正在提取: {original_tar_path}")
         with tarfile.open(original_tar_path, 'r') as tar:
             tar.extractall(temp_dir)
+        
+        # 设置临时目录的权限为完全读写执行
+        print(f"修改目录权限: {temp_dir}")
+        os.chmod(temp_dir, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)  # 777权限
+        
+        # 使用bash命令修改所有文件的权限
+        try:
+            subprocess.run(f"chmod -R 666 {temp_dir}/*", shell=True, check=True)
+            print("已修改所有文件权限")
+        except subprocess.SubprocessError as e:
+            print(f"修改文件权限时出错: {e}")
         
         # 2. 找出所有文件组
         file_groups = {}  # 按前缀分组
@@ -116,6 +132,9 @@ def process_single_tar(original_tar_path, new_tar_path, url_to_captions_map, sta
                 # 读取并修改JSON
                 json_path = os.path.join(temp_dir, json_file)
                 try:
+                    # 确保JSON文件有读写权限
+                    os.chmod(json_path, 0o666)  # 设置为666权限
+
                     with open(json_path, 'r', encoding='utf-8') as f:
                         try:
                             json_data = json.load(f)
@@ -139,6 +158,16 @@ def process_single_tar(original_tar_path, new_tar_path, url_to_captions_map, sta
                         # 写回JSON文件
                         with open(json_path, 'w', encoding='utf-8') as f:
                             json.dump(json_data, f, ensure_ascii=False)
+                    else:
+                        # 记录未匹配的URL
+                        if unmatched_urls is not None:
+                            uid = prefix  # 使用文件前缀作为UID
+                            local_unmatched_urls.append({
+                                'uid': uid,
+                                'url': url,
+                                'tar_file': tar_basename
+                            })
+                        
                 except Exception as e:
                     print(f"处理JSON文件 {json_path} 时出错: {str(e)}")
                     continue
@@ -165,7 +194,11 @@ def process_single_tar(original_tar_path, new_tar_path, url_to_captions_map, sta
         stats['total_matched'] += matched_count
         stats['match_rate'] = stats['total_matched'] / stats['total_processed'] if stats['total_processed'] > 0 else 0
         
-        print(f"处理完成: {tar_basename}, 处理: {processed_count}, 匹配: {matched_count}")
+        # 返回本地收集的未匹配URL
+        if unmatched_urls is not None:
+            unmatched_urls.extend(local_unmatched_urls)
+        
+        print(f"处理完成: {tar_basename}, 处理: {processed_count}, 匹配: {matched_count}, 未匹配: {processed_count - matched_count}")
         return processed_count, matched_count
     
     except Exception as e:
@@ -194,6 +227,8 @@ def main():
                         help="并行处理的worker数量")
     parser.add_argument("--tmp_dir", type=str, default="/tmp",
                         help="临时文件目录（默认为/tmp，应该是Linux文件系统）")
+    parser.add_argument("--unmatched_output", type=str, default="unmatched_urls.csv",
+                        help="未匹配URL的输出文件路径")
     
     args = parser.parse_args()
     
@@ -227,12 +262,15 @@ def main():
     stats['total_matched'] = 0
     stats['match_rate'] = 0
     
+    # 收集未匹配的URL列表
+    unmatched_urls = []
+    
     # 创建任务列表
     tasks = []
     for tar_file in selected_tars:
         original_tar_path = os.path.join(args.input_dir, tar_file)
         new_tar_path = os.path.join(args.output_dir, tar_file)
-        tasks.append((original_tar_path, new_tar_path, url_to_captions_map, stats))
+        tasks.append((original_tar_path, new_tar_path, url_to_captions_map, stats, unmatched_urls))
     
     # 串行或并行处理
     if args.num_workers <= 1:
@@ -240,15 +278,27 @@ def main():
         for task in tasks:
             process_single_tar(*task)
     else:
-        # 并行处理
+        # 并行处理时需要使用Manager列表
+        unmatched_urls = manager.list()
+        tasks = [(t[0], t[1], t[2], t[3], unmatched_urls) for t in tasks]
         with multiprocessing.Pool(args.num_workers) as pool:
             pool.starmap(process_single_tar, tasks)
+        # 转换为普通列表
+        unmatched_urls = list(unmatched_urls)
     
     # 打印最终统计
     print("\n转换完成!\n")
     print(f"总处理样本数: {stats['total_processed']}")
     print(f"成功匹配样本数: {stats['total_matched']}")
     print(f"匹配率: {stats['match_rate']*100:.2f}%")
+    
+    # 将未匹配的URL写入CSV文件
+    if unmatched_urls:
+        unmatched_file = args.unmatched_output
+        print(f"\n保存未匹配URL到文件: {unmatched_file}")
+        unmatched_df = pd.DataFrame(unmatched_urls)
+        unmatched_df.to_csv(unmatched_file, index=False)
+        print(f"共保存 {len(unmatched_urls)} 个未匹配的URL")
 
 if __name__ == "__main__":
     start_time = time.time()

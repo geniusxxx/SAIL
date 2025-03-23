@@ -77,4 +77,42 @@ https://s-media-cache-ak0.pinimg.com/736x/99/57/38/995738352e7f0fa677c5b082fc585
         }
     ```
 
-- 
+# yfcc15m-parquet数据集转换
+
+## 原始yfcc15m数据集
+
+- 格式：parquet
+
+    - images：原始图片
+
+    - texts：原始文本的token embedding，可利用tokenizer还原成原始文本
+
+## yfcc15m-recap-wds数据集
+
+要把原始的yfcc15m数据集转换成新的yfcc15m-recap-wds数据集
+
+- 格式：wds
+
+    - 一张图片
+
+    - json文件：
+
+        ```json
+            {
+                "raw_caption": ["how to build an industry for dollars"],  // 单元素数组
+                "shortIB_captions": ["a small cabin being built in the middle of a field"],
+                "longIB_captions": ["In the image, there is a small black house with..."],
+                "shortSV_captions": ["A wooden building with a green roof is under construction."],
+                "longSV_captions": ["The image captures a tranquil scene in a wooded area..."],
+                "shortLLA_captions": ["A small wooden building is being constructed with a green roof."],
+                "longLLA_captions": ["The image features a small wooden cabin with a green roof..."]
+            }
+        ```
+
+## 转换步骤
+
+目前的`yfcc15m_to_wds.py`代码实现的是将原始yfcc15m-parquet转换为wds格式，即得到原始图片+用tokenizer还原的原始文本
+
+- 根据我的推测，原始文本应该就是新数据集的raw_caption，对于原数据集：原始文本与图片对应；对于新数据集的parquet文件`yfcc15m_3long_3short_1raw_captions_url.parquet`（里面是图片的url和对应的recap的七个captions），新文本与url对应，而新闻本中的raw_caption就是原始数据集的caption，因此可以建立映射关系
+
+- 这样就可以直接把原始数据集的图片和新数据集的七个captions组成的json文件对应起来，构建新的yfcc15m-recap-wds数据集。
